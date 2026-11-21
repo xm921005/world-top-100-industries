@@ -81,6 +81,25 @@ SECTORS = [
     ("HYG", "高收益债", "垃圾债"), ("LQD", "投资级公司债", "公司债"),
     ("SPY", "标普500", "美股宽基"), ("QQQ", "纳斯达克100", "科技宽基"),
     ("IWM", "罗素2000", "小盘股"), ("DIA", "道琼斯", "蓝筹宽基"),
+    # 补充候选池：行业/主题 ETF（抓取失败会自动剔除，确保最终能凑够 100）
+    ("IHI", "医疗器械", "医疗设备"), ("IAK", "保险", "财产意外险"),
+    ("IYT", "运输物流", "交通运输"), ("JETS", "航空", "航空运输"),
+    ("PEJ", "休闲娱乐", "休闲娱乐"), ("IBUY", "电商", "在线零售"),
+    ("UFO", "太空探索", "太空产业"), ("ARKQ", "自动驾驶", "自动驾驶"),
+    ("ARKG", "基因组学", "基因技术"), ("ARKW", "下一代互联网", "互联网"),
+    ("ARKX", "太空创新", "太空产业"), ("CIBR", "网络安全", "网络安全"),
+    ("BUG", "网络安全", "网络威胁"), ("ROBO", "机器人", "机器人自动化"),
+    ("QCLN", "清洁能源", "清洁技术"), ("CTEC", "清洁技术", "清洁技术"),
+    ("GRID", "电网基础设施", "电网"), ("DBA", "农业", "农产品"),
+    ("CORN", "玉米", "玉米商品"), ("SOYB", "大豆", "大豆商品"),
+    ("WEAT", "小麦", "小麦商品"), ("PPLT", "铂金", "铂族金属"),
+    ("SOXQ", "半导体", "半导体芯片"), ("FDN", "互联网", "互联网基建"),
+    ("FDG", "零售", "零售"), ("FXR", "零售", "零售"),
+    ("FDH", "医疗服务", "医疗服务"), ("FXH", "医疗", "医疗综合"),
+    ("FXG", "必需消费", "消费必需品"), ("FXZ", "原材料", "原材料综合"),
+    ("RWR", "房地产", "房地产"), ("SCHH", "房地产", "房地产"),
+    ("IDU", "公用事业", "公用事业"), ("PKW", "公用事业", "公用事业"),
+    ("VRIG", "浮动利率债", "浮息债"), ("JPST", "超短债", "超短债"),
 ]
 
 UA_POOL = [
@@ -90,9 +109,8 @@ UA_POOL = [
 ]
 
 
-def fetch_chart(symbol, retries=3):
+def fetch_chart(symbol, retries=4):
     """抓 Yahoo chart 一年日线，返回 (timestamps, closes)。"""
-    last_err = None
     for attempt in range(retries):
         host = "query1.finance.yahoo.com" if (attempt % 2 == 0) else "query2.finance.yahoo.com"
         url = f"https://{host}/v8/finance/chart/{symbol}?range=1y&interval=1d"
@@ -106,9 +124,13 @@ def fetch_chart(symbol, retries=3):
             if not ts or not closes:
                 return None, None
             return ts, closes
-        except Exception as e:  # noqa: BLE001 - 网络抓取需容错
-            last_err = e
-            time.sleep(0.6 * (attempt + 1))
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403, 404):  # 代码无效或被限流，换域名重试
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            time.sleep(0.8 * (attempt + 1))
+        except Exception:  # noqa: BLE001 - 网络抓取需容错
+            time.sleep(0.8 * (attempt + 1))
     return None, None
 
 
@@ -144,17 +166,22 @@ def compute_one(item):
 
 def build_ranking():
     rows = []
-    with ThreadPoolExecutor(max_workers=12) as ex:
+    failed = []
+    # 降低并发，避免 Yahoo 限流导致大面积抓取失败
+    with ThreadPoolExecutor(max_workers=5) as ex:
         futures = {ex.submit(compute_one, s): s for s in SECTORS}
         for fut in as_completed(futures):
+            sym = futures[fut]
             try:
                 row = fut.result()
             except Exception:  # noqa: BLE001
                 row = None
             if row:
                 rows.append(row)
+            else:
+                failed.append(sym[0])
     rows.sort(key=lambda x: x["r1m"], reverse=True)
-    return rows[:100], len(rows)
+    return rows[:100], len(rows), failed
 
 
 def fmt_pct(v):
@@ -194,7 +221,7 @@ def update_readme(table, updated, total):
 
 def main():
     os.makedirs(DATA_DIR, exist_ok=True)
-    rows, total = build_ranking()
+    rows, total, failed = build_ranking()
     if not rows:
         raise SystemExit("抓取失败：没有任何有效行业数据，请检查网络/数据源。")
     updated = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
@@ -206,12 +233,16 @@ def main():
         "criteria": "近1月收益率(%)降序；行业由美股行业/主题ETF代理",
         "unit": "percent",
         "valid_samples": total,
+        "candidate_count": len(SECTORS),
+        "failed_symbols": failed,
         "top100": rows,
     }
     with open(LATEST_JSON, "w", encoding="utf-8", newline="\n") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    print(f"OK updated={updated} valid_samples={total} top={rows[0]['name']} {fmt_pct(rows[0]['r1m'])}")
+    print(f"OK updated={updated} valid_samples={total}/{len(SECTORS)} failed={len(failed)} top={rows[0]['name']} {fmt_pct(rows[0]['r1m'])}")
+    if failed:
+        print("FAILED_SYMBOLS:", ",".join(failed))
 
 
 if __name__ == "__main__":
